@@ -403,6 +403,7 @@ test("on-load writes a snapshot before opening the panel and the tool groups by 
     mkdirSync(fixture.dataPath, { recursive: true });
     plugin.__test.setScanRoots({
       piDesktop: fixture.sessions,
+      piAgent: join(fixture.root, "missing-pi-agent"),
       claudeCode: join(fixture.root, "missing-claude"),
       codex: join(fixture.root, "missing-codex"),
       openCode: join(fixture.root, "missing-opencode"),
@@ -469,4 +470,177 @@ test("on-load writes a snapshot before opening the panel and the tool groups by 
     globalThis.pi = previousPi;
     fixture.cleanup();
   }
+
+test("pi agent adapter reads the pi-usage SQLite tier with uuid-tail session ids", async () => {
+  let sqlite;
+  try {
+    sqlite = require("node:sqlite");
+  } catch {
+    return; // plugin host Node without built-in SQLite — tier is skipped there too
+  }
+  if (!sqlite?.DatabaseSync) return;
+  const fixture = createFixture();
+  try {
+    const dbDir = join(fixture.root, "pi-usage");
+    mkdirSync(dbDir, { recursive: true });
+    const db = new sqlite.DatabaseSync(join(dbDir, "usage.db"));
+    db.exec(`CREATE TABLE turns (
+      session_path TEXT,
+      ts INTEGER,
+      model TEXT,
+      provider TEXT,
+      input INTEGER,
+      output INTEGER,
+      cache_read INTEGER,
+      cache_write INTEGER,
+      total_tokens INTEGER
+    )`);
+    const insert = db.prepare(
+      "INSERT INTO turns (session_path, ts, model, provider, input, output, cache_read, cache_write, total_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const day = new Date(2026, 6, 30, 12).getTime();
+    insert.run(
+      "C:/home/2026-07-30T08-00-00-000Z_a1b2c3d4-1111-2222-3333-444455556666.jsonl",
+      day,
+      "glm-5.3",
+      "zai",
+      100,
+      50,
+      20,
+      5,
+      175,
+    );
+    // Zero-usage rows exist in the real database (empty turns); toTokens drops them.
+    insert.run("C:/home/2026-07-30T09-00-00-000Z_deadbeef-1111-2222-3333-444455556666.jsonl", day + 1000, "glm-5.3", "zai", 0, 0, 0, 0, 0);
+    db.close();
+
+    const result = await plugin.__test.scanPiAgentUsage(fixture.root);
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0].sourceId, "pi-agent");
+    assert.equal(result.events[0].sessionId, "pi-agent:a1b2c3d4-1111-2222-3333-444455556666");
+    assert.equal(result.events[0].timestamp, day);
+    assert.equal(result.events[0].modelId, "glm-5.3");
+    assert.equal(result.events[0].providerId, "zai");
+    assert.deepEqual(result.events[0].tokens, {
+      input: 100,
+      output: 50,
+      cacheRead: 20,
+      cacheWrite: 5,
+      reasoning: 0,
+      total: 175,
+    });
+    assert.equal(result.diagnostics.filesScanned, 1);
+    assert.equal(result.diagnostics.usageMessages, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("pi agent adapter falls back to the extension's legacy JSON cache", async () => {
+  const fixture = createFixture();
+  try {
+    const day = new Date(2026, 6, 30, 12).getTime();
+    writeFileSync(
+      join(fixture.root, "usage-cache.json"),
+      JSON.stringify({
+        version: 4,
+        pricesKey: "",
+        sessions: {
+          "C:/home/2026-07-30T08-00-00-000Z_a1b2c3d4-1111-2222-3333-444455556666.jsonl": {
+            mtimeMs: 1,
+            size: 2,
+            entries: [
+              {
+                ts: day,
+                model: "glm-5.3",
+                provider: "zai",
+                usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: { total: 0 } },
+              },
+              { ts: 0, model: "glm-5.3", provider: "zai", usage: { input: 1, output: 1, cost: { total: 0 } } },
+            ],
+          },
+        },
+      }),
+    );
+
+    const result = await plugin.__test.scanPiAgentUsage(fixture.root);
+    assert.equal(result.events.length, 1); // the ts=0 entry is dropped
+    assert.equal(result.events[0].sessionId, "pi-agent:a1b2c3d4-1111-2222-3333-444455556666");
+    assert.deepEqual(result.events[0].tokens, {
+      input: 10,
+      output: 5,
+      cacheRead: 2,
+      cacheWrite: 1,
+      reasoning: 0,
+      total: 18,
+    });
+    assert.equal(result.diagnostics.filesScanned, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("pi agent adapter streams raw session JSONL as the last resort", async () => {
+  const fixture = createFixture();
+  try {
+    const projectDir = join(fixture.root, "sessions", "project-a");
+    mkdirSync(projectDir, { recursive: true });
+    const day = new Date(2026, 6, 30, 12).getTime();
+    writeJsonl(projectDir, "2026-07-30T08-00-00-000Z_cafebabe-1111-2222-3333-444455556666.jsonl", [
+      { type: "session", version: 3, id: "cafebabe-1111-2222-3333-444455556666", timestamp: day, cwd: "C:/private-path" },
+      { type: "model_change", id: "m1", timestamp: day, provider: "zai", modelId: "glm-5.3" },
+      { type: "message", timestamp: day + 1000, message: { role: "user", content: "not usage" } },
+      {
+        type: "message",
+        timestamp: day + 2000,
+        message: {
+          role: "assistant",
+          model: "glm-5.3",
+          provider: "zai",
+          timestamp: day + 2000,
+          usage: { input: 200, output: 80, cacheRead: 20, cacheWrite: 0, totalTokens: 300 },
+        },
+      },
+      { type: "message", timestamp: day + 3000, message: { role: "assistant", model: "glm-5.3", usage: null } },
+    ]);
+    writeFileSync(join(projectDir, "broken.jsonl"), "{bad json}\n");
+
+    const result = await plugin.__test.scanPiAgentUsage(fixture.root);
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0].sourceId, "pi-agent");
+    assert.equal(result.events[0].sessionId, "pi-agent:cafebabe-1111-2222-3333-444455556666");
+    assert.deepEqual(result.events[0].tokens, {
+      input: 200,
+      output: 80,
+      cacheRead: 20,
+      cacheWrite: 0,
+      reasoning: 0,
+      total: 300,
+    });
+    assert.equal(result.diagnostics.malformedLines, 1);
+    assert.doesNotMatch(JSON.stringify(result), /private-path|not usage/i);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("watchRoots narrows the pi agent root to its usage-bearing subdirectories", async () => {
+  const fixture = createFixture();
+  try {
+    const roots = {
+      piDesktop: join(fixture.root, "pd"),
+      piAgent: join(fixture.root, "pi-agent"),
+      claudeCode: join(fixture.root, "cc"),
+      codex: join(fixture.root, "cx"),
+      openCode: join(fixture.root, "oc"),
+    };
+    const watched = plugin.__test.watchRoots(roots);
+    assert.ok(watched.includes(roots.piDesktop));
+    assert.ok(watched.includes(join(roots.piAgent, "sessions")));
+    assert.ok(watched.includes(join(roots.piAgent, "pi-usage")));
+    assert.ok(!watched.includes(roots.piAgent)); // never the whole agent root
+  } finally {
+    fixture.cleanup();
+  }
+});
 });
