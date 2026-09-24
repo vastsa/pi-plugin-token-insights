@@ -21,6 +21,7 @@ const {
   scanClaudeCodeDirectory,
   scanCodexDirectory,
   scanOpenCodeDirectory,
+  scanPiAgentUsage,
   scanPiTranscriptDirectory,
   sourceLabel,
   toTokens,
@@ -72,33 +73,49 @@ async function hostRoot() {
 async function transcriptRoot() {
   return path.join(await hostRoot(), "sessions");
 }
-
-/** The four directories this plugin ever reads usage from. */
+/** The local usage directories this plugin ever reads from. */
 async function sourceRoots() {
   const home = homedir();
   return {
     piDesktop: testRoots?.piDesktop || (await transcriptRoot()),
+    piAgent: testRoots?.piAgent || path.join(home, ".pi", "agent"),
     claudeCode: testRoots?.claudeCode || path.join(home, ".claude", "projects"),
     codex: testRoots?.codex || path.join(home, ".codex", "sessions"),
     openCode: testRoots?.openCode || path.join(home, ".local", "share", "opencode", "storage", "message"),
   };
 }
 
+/**
+ * Directories the source watcher observes. The pi agent root is deliberately
+ * narrowed to its two usage-bearing subdirectories: the root also contains
+ * `npm/node_modules`, and a recursive watch over it would register a handle
+ * per package directory on Linux for nothing.
+ */
+function watchRoots(roots) {
+  const { piAgent, ...rest } = roots;
+  return [
+    ...Object.values(rest),
+    piAgent ? path.join(piAgent, "sessions") : null,
+    piAgent ? path.join(piAgent, "pi-usage") : null,
+  ].filter(Boolean);
+}
+
 async function scanEvents(progress) {
   const roots = await sourceRoots();
   const host = testRoots?.hostRoot || (await hostRoot());
-  const [piJsonl, claudeCode, codex, openCode] = await Promise.all([
+  const [piJsonl, claudeCode, codex, openCode, piAgent] = await Promise.all([
     scanPiTranscriptDirectory(roots.piDesktop, progress),
     scanClaudeCodeDirectory(roots.claudeCode, progress),
     scanCodexDirectory(roots.codex, progress),
     scanOpenCodeDirectory(roots.openCode, progress),
+    scanPiAgentUsage(roots.piAgent, progress),
   ]);
   const turns = readCompletedTurnUsage(host);
   const piDesktop = mergePiDesktopTurnRemainder(piJsonl, turns.events);
   if (turns.diagnostics?.filesScanned) {
     piDesktop.diagnostics.filesScanned += turns.diagnostics.filesScanned;
   }
-  return mergeResults([piDesktop, claudeCode, codex, openCode]);
+  return mergeResults([piDesktop, claudeCode, codex, openCode, piAgent]);
 }
 
 /**
@@ -444,7 +461,7 @@ async function onLoad() {
   await pi.agent.registerTool({
     name: "token_usage_summary",
     description:
-      "Scan supported local AI-tool metadata and summarize token use by tool source, model, provider, day, " +
+      "Scan supported local AI-tool metadata (PI-Desktop, PI Agent, Claude Code, Codex, OpenCode) and summarize token use by tool source, model, provider, day, " +
       "or short session id. Supports the same filters as the dashboard and never returns message text.",
     risk: "medium",
     schema: {
@@ -463,7 +480,7 @@ async function onLoad() {
     execute: buildReport,
   });
 
-  startSourceWatch(await sourceRoots());
+  startSourceWatch(watchRoots(await sourceRoots()));
   void refreshFacts("load").catch((error) =>
     pi.ui.showToast(`Token Insights scan failed: ${error.message}`, "warn"),
   );
@@ -486,7 +503,8 @@ module.exports = {
     collectFacts,
     progressReporter,
     refreshFacts,
-    sourceRoots,
+    scanPiAgentUsage,
+    watchRoots,
     milestones,
     parseInstant,
     readHostAppearance,

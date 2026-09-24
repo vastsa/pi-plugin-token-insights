@@ -3,12 +3,13 @@
  * Parsed records are discarded immediately and never enter the plugin snapshot.
  */
 
-const { createReadStream, existsSync, readdirSync, readFileSync } = require("node:fs");
+const { createReadStream, existsSync, readdirSync, readFileSync, statSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const path = require("node:path");
 
 const SOURCE_LABELS = {
   "pi-desktop": "PI-Desktop",
+  "pi-agent": "PI Agent",
   "claude-code": "Claude Code",
   codex: "Codex",
   opencode: "OpenCode",
@@ -230,6 +231,185 @@ function scanOpenCodeDirectory(root, progress = noopProgress()) {
   return result;
 }
 
+/* -------------------------------------------------- pi agent (pi CLI harness) */
+
+/**
+ * The pi coding-agent CLI keeps its sessions under ~/.pi/agent. Rather than
+ * re-parsing hundreds of MB of transcripts, read the pre-attributed turn rows
+ * the pi-usage extension (@zaganjade/pi-usage) maintains in SQLite at
+ * ~/.pi/agent/pi-usage/usage.db. Falls back to that extension's legacy JSON
+ * cache, and finally to streaming the raw session JSONL (newest files first).
+ */
+const PI_AGENT_SOURCE = "pi-agent";
+const PI_AGENT_JSONL_CAP = 1000;
+function piAgentSessionId(sessionPath) {
+  const base = path.basename(String(sessionPath || "unknown"), ".jsonl");
+  // Session files are named `<ISO-timestamp>_<uuid>.jsonl`; the uuid tail is
+  // the stable identity, and the aggregate layer keeps only its first 8 chars.
+  const underscore = base.lastIndexOf("_");
+  return (underscore >= 0 ? base.slice(underscore + 1) : base) || base;
+}
+
+function piAgentEvent(sessionPath, timestamp, modelId, providerId, usage) {
+  const raw = typeof timestamp === "number" ? timestamp : Date.parse(String(timestamp));
+  const ts = Number.isFinite(raw) ? raw : 0;
+  if (!ts) return null;
+  return event(
+    PI_AGENT_SOURCE,
+    piAgentSessionId(sessionPath),
+    ts,
+    modelId,
+    providerId || PI_AGENT_SOURCE,
+    toTokens(usage),
+  );
+}
+
+function scanPiAgentDatabase(dbFile, result, progress) {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch {
+    return false; // plugin host Node without built-in SQLite
+  }
+  let db;
+  try {
+    try {
+      db = new DatabaseSync(dbFile, { readOnly: true });
+    } catch {
+      db = new DatabaseSync(dbFile);
+    }
+  } catch {
+    result.diagnostics.filesSkipped += 1;
+    return false;
+  }
+  progress.addTotal(1);
+  try {
+    // Reading a WAL database from another process is safe: writers never block readers.
+    const rows = db
+      .prepare(
+        "SELECT session_path, ts, model, provider, input, output, cache_read, cache_write, total_tokens FROM turns",
+      )
+      .all();
+    for (const row of rows) {
+      const scanned = piAgentEvent(row.session_path, row.ts, row.model, row.provider, {
+        input: row.input,
+        output: row.output,
+        cacheRead: row.cache_read,
+        cacheWrite: row.cache_write,
+        totalTokens: row.total_tokens,
+      });
+      if (scanned) {
+        result.events.push(scanned);
+        result.diagnostics.usageMessages += 1;
+      }
+    }
+    result.diagnostics.filesScanned += 1;
+    return true;
+  } catch {
+    result.diagnostics.filesSkipped += 1;
+    return false;
+  } finally {
+    progress.tick();
+    try {
+      db.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+function scanPiAgentJsonCache(cacheFile, result) {
+  try {
+    const parsed = JSON.parse(readFileSync(cacheFile, "utf8"));
+    const sessions = parsed?.sessions;
+    if (!sessions || typeof sessions !== "object") return false;
+    for (const [file, cached] of Object.entries(sessions)) {
+      for (const entry of cached?.entries || []) {
+        const usage = entry?.usage || {};
+        const scanned = piAgentEvent(file, entry.ts, entry.model, entry.provider, {
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+          totalTokens: usage.totalTokens,
+        });
+        if (scanned) {
+          result.events.push(scanned);
+          result.diagnostics.usageMessages += 1;
+        }
+      }
+    }
+    result.diagnostics.filesScanned += 1;
+    return true;
+  } catch {
+    result.diagnostics.filesSkipped += 1;
+    return false;
+  }
+}
+
+async function scanPiAgentSessionFiles(sessionsRoot, result, progress) {
+  if (!existsSync(sessionsRoot)) {
+    result.diagnostics.filesSkipped += 1;
+    return;
+  }
+  let planned;
+  try {
+    const all = listFiles(sessionsRoot, ".jsonl").sort(
+      (left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs,
+    );
+    planned = new Set(all.slice(0, PI_AGENT_JSONL_CAP));
+  } catch {
+    result.diagnostics.filesSkipped += 1;
+    return;
+  }
+  const streamed = await scanJsonl(
+    sessionsRoot,
+    PI_AGENT_SOURCE,
+    (file) => planned.has(file),
+    (file) => (record) => {
+      if (record?.type !== "message" || record?.message?.role !== "assistant") return null;
+      const message = record.message;
+      const usage = message.usage;
+      if (!usage) return null;
+      return piAgentEvent(
+        file,
+        message.timestamp || record.timestamp,
+        message.model || message.provider,
+        message.provider,
+        {
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+          totalTokens: usage.totalTokens,
+        },
+      );
+    },
+    progress,
+  );
+  result.events = result.events.concat(streamed.events);
+  result.diagnostics.filesScanned += streamed.diagnostics.filesScanned;
+  result.diagnostics.filesSkipped += streamed.diagnostics.filesSkipped;
+  result.diagnostics.malformedLines += streamed.diagnostics.malformedLines;
+}
+
+async function scanPiAgentUsage(agentRoot, progress = noopProgress()) {
+  const result = { events: [], diagnostics: diagnostics(PI_AGENT_SOURCE) };
+  if (!agentRoot || !existsSync(agentRoot)) {
+    result.diagnostics.filesSkipped += 1;
+    return result;
+  }
+  if (scanPiAgentDatabase(path.join(agentRoot, "pi-usage", "usage.db"), result, progress)) {
+    return result;
+  }
+  if (scanPiAgentJsonCache(path.join(agentRoot, "usage-cache.json"), result)) {
+    return result;
+  }
+  await scanPiAgentSessionFiles(path.join(agentRoot, "sessions"), result, progress);
+  return result;
+}
+
+
 const TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "total"];
 
 function emptyTokenBag() {
@@ -345,6 +525,7 @@ module.exports = {
   scanClaudeCodeDirectory,
   scanCodexDirectory,
   scanOpenCodeDirectory,
+  scanPiAgentUsage,
   scanPiTranscriptDirectory,
   sourceLabel,
   toTokens,

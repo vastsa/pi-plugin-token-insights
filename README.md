@@ -85,6 +85,7 @@ Everything is local and read-only:
 | Read | Why |
 | --- | --- |
 | `~/.pi-desktop/sessions/*.jsonl` | assistant-reply usage counts |
+| `~/.pi/agent/pi-usage/usage.db` (or `usage-cache.json` / `sessions/*.jsonl`) | PI Agent CLI totals, via the [pi-usage](https://github.com/ZaganJade/pi-extension) extension's pre-aggregated SQLite cache when present |
 | `pi.sqlite` → `turns` | completed-turn totals, including subagent spend missing from `message.usage` |
 | `~/.claude/projects`, `~/.codex/sessions`, `~/.local/share/opencode/storage/message` | the same, for those tools |
 | `pi.sqlite` → `kv(ns='app')` | the app's theme and language |
